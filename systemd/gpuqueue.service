@@ -1,0 +1,29 @@
+[Unit]
+Description=cxl2 shared single-slot Task Spooler queue
+After=local-fs.target
+RequiresMountsFor=/mnt/nvme1
+
+[Service]
+Type=forking
+User=gpuqueue
+Group=gpuqueue
+UMask=0007
+RuntimeDirectory=gpuqueue
+RuntimeDirectoryMode=0750
+StateDirectory=gpuqueue
+StateDirectoryMode=0750
+Environment=TS_SOCKET=/run/gpuqueue/queue.sock
+Environment=TS_SLOTS=1
+Environment=TS_MAXFINISHED=1000
+Environment=TS_MAXCONN=128
+Environment=TS_SAVELIST=/var/lib/gpuqueue/queue.last
+Environment=TMPDIR=/var/lib/gpuqueue
+ExecStart=/usr/local/libexec/gpuqueue-start
+ExecStop=/usr/bin/tsp -K
+KillMode=control-group
+Restart=no
+TimeoutStartSec=15
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

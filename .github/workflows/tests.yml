@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Python syntax
+        run: python -m py_compile gpuq gpuqueue-wait-exec gpuqueue_daos.py gpuqueue_node.py activate_nvme.py deploy.py provision_test.py run_e2e.py run_fault_e2e.py run_nvme_e2e.py tests/test_lifecycle.py
+      - name: Shell syntax
+        run: bash -n gpuqueue-start smoke.sh
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

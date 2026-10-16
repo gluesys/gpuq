@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""Wait for GPU 0 to be idle, then exec the submitted command."""
+import os
+import subprocess
+import sys
+import time
+import json
+import socket
+from pathlib import Path
+
+
+def lifecycle_hold():
+    maintenance = Path('/etc/gpuqueue-daos/maintenance.json')
+    if os.getuid() != 0 and maintenance.exists():
+        return 'Maintenance locked: ' + json.loads(maintenance.read_text())['reason']
+    # Fail closed if the installed lifecycle service is down. Never bypass an interrupted reset.
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(os.environ.get('GPUQ_DAOS_SOCKET', '/run/gpuqueue-daos/control.sock'))
+            conn.sendall(b'{"action":"status"}\n')
+            status = json.loads(conn.makefile('r').readline())['status']
+            if status['blocked']:
+                return 'DAOS recovery hold: ' + status['blocked']['reason']
+            if status['active']:
+                return 'DAOS previous lease is still ' + status['active']['phase']
+    except (OSError, KeyError, ValueError) as error:
+        return 'DAOS lifecycle broker unavailable (' + type(error).__name__ + ')'
+    return None
+
+
+def metric(field, kind):
+    return subprocess.check_output(
+        ["/usr/bin/nvidia-smi", "-i", "0", f"--query-{kind}={field}",
+         "--format=csv,noheader,nounits"], text=True, timeout=15).strip()
+
+
+if len(sys.argv) < 2:
+    sys.exit("gpuqueue: command required")
+last_message = 0
+inst = None
+deadline = None
+if sys.argv[1:2] == ['--gpuq-daos']:
+    inst, seconds = sys.argv[2:4]
+    if sys.argv[4] != '--' or len(sys.argv) < 6:
+        sys.exit('Invalid DAOS lifecycle arguments')
+    deadline = time.monotonic() + int(seconds)
+    command = sys.argv[5:]
+else:
+    command = sys.argv[1:]
+while True:
+    if deadline is not None and time.monotonic() >= deadline:
+        sys.exit(124)
+    try:
+        hold = lifecycle_hold()
+        processes = metric("pid", "compute-apps")
+        used_mib = int(metric("memory.used", "gpu"))
+        if not hold and not processes and used_mib <= 1024:
+            break
+        pids = processes.replace("\n", ",") or "none"
+        reason = hold or f"GPU 0 occupied: compute PIDs={pids}, used={used_mib} MiB"
+    except (subprocess.SubprocessError, ValueError, OSError) as error:
+        reason = f"GPU readiness check failed ({type(error).__name__}); not starting command"
+    now = time.monotonic()
+    if now - last_message >= 60:
+        print(f"gpuqueue: waiting; {reason}", flush=True)
+        last_message = now
+    time.sleep(5)
+
+print("gpuqueue: GPU 0 idle; starting command", flush=True)
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+if inst:
+    remaining = max(1, int(deadline - time.monotonic()))
+    os.execv('/usr/local/libexec/gpuqueue-daos',
+             ['gpuqueue-daos', 'run', inst, str(remaining), '--', *command])
+os.execvp(command[0], command)

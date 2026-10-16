@@ -1,0 +1,25 @@
+[Unit]
+Description=GPU queue exclusive four-server DAOS lifecycle broker
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/nvme1
+
+[Service]
+Type=simple
+User=root
+Group=gpuqueue
+RuntimeDirectory=gpuqueue-daos
+RuntimeDirectoryMode=0750
+StateDirectory=gpuqueue-daos
+StateDirectoryMode=0755
+UMask=0022
+ExecStart=/usr/local/libexec/gpuqueue-daos serve
+Restart=on-failure
+RestartSec=3
+# Graceful daemon stop must allow cleanup on all four hosts.
+KillMode=mixed
+TimeoutStopSec=600
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

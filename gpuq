@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+"""Small CLI for cxl2's single shared Task Spooler queue."""
+import argparse
+import grp
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import time
+
+SOCKET = "/run/gpuqueue/queue.sock"
+JOB_ROOT = Path("/run/gpuqueue/jobs")
+LOG_ROOT = Path("/mnt/nvme1/gpuqueue/logs")
+TSP = "/usr/bin/tsp"
+MAINTENANCE = Path('/etc/gpuqueue-daos/maintenance.json')
+
+
+def maintenance():
+    return json.loads(MAINTENANCE.read_text()) if MAINTENANCE.exists() else None
+
+
+def change_lock(locked, reason='Administrator maintenance'):
+    if os.getuid() != 0:
+        sys.exit('gpuq: only root can lock or unlock the queue.')
+    if locked:
+        MAINTENANCE.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        tmp = MAINTENANCE.with_suffix('.tmp')
+        with tmp.open('w') as f:
+            os.fchmod(f.fileno(), 0o644)
+            json.dump(dict(reason=reason, locked_at=time.time(), locked_by=0), f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, MAINTENANCE)
+    else:
+        MAINTENANCE.unlink(missing_ok=True)
+    print('gpuq: maintenance ' + ('locked; only root test jobs are allowed.' if locked else 'unlocked.'))
+
+
+def duration(value):
+    match = re.fullmatch(r"([1-9][0-9]*)([smh]?)", value)
+    if not match:
+        raise argparse.ArgumentTypeError("Use a positive duration, e.g. 30m, 4h or 120s.")
+    seconds = int(match[1]) * {"": 1, "s": 1, "m": 60, "h": 3600}[match[2]]
+    if seconds > 28800:
+        raise argparse.ArgumentTypeError("Maximum duration is 8h.")
+    return seconds
+
+
+def queue_env():
+    uid = os.getuid()
+    queue_gid = grp.getgrnam("gpuqueue").gr_gid
+    if uid != 0 and queue_gid not in [os.getgid(), *os.getgroups()]:
+        sys.exit("gpuq: gpuqueue group membership required; reconnect SSH after enrolment.")
+    try:
+        if not stat.S_ISSOCK(os.stat(SOCKET).st_mode):
+            raise OSError("not a socket")
+    except OSError:
+        sys.exit("gpuq: queue unavailable; ask the administrator to check gpuqueue.service.")
+    # Each submitting user owns their logs; the queue daemon does not run jobs.
+    logdir = LOG_ROOT / str(uid)
+    logdir.mkdir(mode=0o700, exist_ok=True)
+    metadata = logdir.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid:
+        sys.exit("gpuq: invalid per-user log directory; ask the administrator.")
+    os.chmod(logdir, 0o700)
+    env = dict(os.environ, TS_SOCKET=SOCKET, TMPDIR=str(logdir))
+    return env
+
+
+def query(env, *args):
+    result = subprocess.run([TSP, *args], env=env, text=True, capture_output=True)
+    if result.returncode:
+        sys.exit(result.stderr.strip() or result.stdout.strip() or "gpuq: query failed")
+    return result.stdout.strip()
+
+
+def own_job(env, job_id):
+    marker = JOB_ROOT / str(job_id)
+    if marker.exists():
+        if os.getuid() not in (0, marker.stat().st_uid):
+            sys.exit("gpuq: only the submitting user or root can operate on this job.")
+        return
+    output = Path(query(env, "-o", str(job_id)))
+    if os.getuid() != 0 and output.parent != LOG_ROOT / str(os.getuid()):
+        sys.exit("gpuq: only the submitting user or root can operate on this job.")
+    try:
+        owner = output.stat().st_uid
+    except OSError:
+        sys.exit("gpuq: job log missing; administrator must inspect this job.")
+    if os.getuid() not in (0, owner):
+        sys.exit("gpuq: only the submitting user or root can operate on this job.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_subparsers(dest="action")
+    submit = actions.add_parser("submit", help="Queue a GPU command (default 4h, max 8h).")
+    submit.add_argument("--time", type=duration, default=14400)
+    submit.add_argument("--label", default="gpu")
+    submit.add_argument("--inst", choices=("inst1", "inst2"),
+                        help="Run an exclusive four-server DAOS lifecycle; all experiment DAOS data is reset afterwards.")
+    submit.add_argument("command", nargs=argparse.REMAINDER)
+    actions.add_parser("list", help="Show the shared queue.")
+    actions.add_parser("gpu", help="Show current GPU processes.")
+    actions.add_parser("daos-status", help="Show DAOS lease and recovery hold.")
+    lock = actions.add_parser('lock', help='Root: block new user workloads during maintenance.')
+    lock.add_argument('--reason', default='Administrator maintenance')
+    actions.add_parser('unlock', help='Root: allow user workloads after maintenance.')
+    dexec = actions.add_parser("daos-exec", help="Inside an --inst job, run a client command in its DAOS image.")
+    dexec.add_argument("command", nargs=argparse.REMAINDER)
+    for name, help_text in [("log", "Read this job's output."),
+                            ("follow", "Follow this job's output."),
+                            ("wait", "Wait for a job and return its exit status."),
+                            ("cancel", "Remove a queued job or terminate a running job.")]:
+        sub = actions.add_parser(name, help=help_text)
+        sub.add_argument("job_id", type=int)
+    args = parser.parse_args()
+    if args.action in ('lock', 'unlock'):
+        change_lock(args.action == 'lock', getattr(args, 'reason', ''))
+        return
+    hold = maintenance()
+    if args.action == 'submit' and hold and os.getuid() != 0:
+        sys.exit('gpuq: maintenance locked: ' + hold['reason'])
+    if args.action == "gpu":
+        os.execv("/usr/bin/nvidia-smi", ["nvidia-smi"])
+    if args.action == "daos-status":
+        os.execv("/usr/local/libexec/gpuqueue-daos", ["gpuqueue-daos", "status"])
+    if args.action == "daos-exec":
+        command = args.command[1:] if args.command[:1] == ["--"] else args.command
+        if not command:
+            parser.error("daos-exec requires a command")
+        os.execv("/usr/local/libexec/gpuqueue-daos", ["gpuqueue-daos", "exec", *command])
+    env = queue_env()
+    if args.action in (None, "list"):
+        if hold:
+            print('gpuq: maintenance locked: ' + hold['reason'], flush=True)
+        os.execve(TSP, [TSP, "-l"], env)
+    if args.action == "submit":
+        command = args.command
+        if command[:1] == ["--"]:
+            command = command[1:]
+        if not command:
+            parser.error("submit requires a command after --")
+        user = pwd.getpwuid(os.getuid()).pw_name
+        label = f"{user}:{args.label}"
+        if any(ord(c) < 32 for c in label) or len(label) > 100:
+            parser.error("label must be at most 100 characters without control characters")
+        if args.inst:
+            validated = subprocess.run(["/usr/local/libexec/gpuqueue-daos", "validate", args.inst])
+            if validated.returncode:
+                sys.exit(validated.returncode)
+            launch = ["/usr/local/libexec/gpuqueue-wait-exec", "--gpuq-daos", args.inst,
+                      str(args.time), "--", *command]
+        else:
+            launch = ["/usr/bin/timeout", "--signal=TERM", "--kill-after=30s", f"{args.time}s",
+                      "/usr/local/libexec/gpuqueue-wait-exec", *command]
+        result = subprocess.run([TSP, "-L", label, *launch],
+                                env=env, text=True, capture_output=True)
+        if result.returncode:
+            sys.exit(result.stderr.strip() or "gpuq: submission failed")
+        job_id = int(result.stdout.strip())
+        try:
+            with (JOB_ROOT / str(job_id)).open("x") as marker:
+                marker.write(user + "\n")
+        except OSError as error:
+            sys.exit(f"gpuq: job {job_id} was submitted, but owner recording failed: {error}")
+        print(job_id)
+        return
+    own_job(env, args.job_id)
+    state = query(env, "-s", str(args.job_id))
+    if args.action in ("log", "follow") and state == "queued":
+        sys.exit("gpuq: job is queued; output becomes available after it starts.")
+    if args.action == "log":
+        output = query(env, "-o", str(args.job_id))
+        os.execv("/usr/bin/cat", ["cat", output])
+    if args.action == "cancel":
+        if state == "queued":
+            flag = "-r"
+        elif state == "running":
+            flag = "-k"
+        else:
+            sys.exit(f"gpuq: job is {state}; nothing to cancel")
+    else:
+        flag = {"follow": "-t", "wait": "-w"}[args.action]
+    os.execve(TSP, [TSP, flag, str(args.job_id)], env)
+
+
+if __name__ == "__main__":
+    main()

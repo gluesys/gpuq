@@ -1,0 +1,14 @@
+# Context: Containerfile plus rpms/ from the DAOS rpm job (including repodata/BUILD_INFO).
+FROM quay.io/rockylinux/rockylinux:8
+RUN dnf -y install epel-release
+COPY rpms/ /opt/gpuq-rpms/
+COPY rpms/BUILD_INFO /usr/share/gpuq-daos/BUILD_INFO
+RUN printf '[gpuq-local]\nname=DAOS experiment RPMs\nbaseurl=file:///opt/gpuq-rpms\nenabled=1\ngpgcheck=0\n' > /etc/yum.repos.d/gpuq-local.repo \
+    && dnf -y --enablerepo=powertools --setopt=install_weak_deps=False install \
+       daos-server daos-client daos-admin libibverbs-utils procps-ng python3 kmod pciutils \
+    && command -v daos_server && command -v daos_agent && command -v dmg && command -v daos \
+    && command -v modprobe && command -v lsmod && command -v lspci \
+    && dnf clean all \
+    && rm -rf /opt/gpuq-rpms /etc/yum.repos.d/gpuq-local.repo
+ENTRYPOINT ["/usr/bin/daos_server"]
+CMD ["version"]

@@ -1,0 +1,23 @@
+name: 버그 보고
+description: gpuq 실행 문제와 재현 방법을 공유합니다.
+body:
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 재현 방법
+      description: 사용한 커밋, 명령, inst, 작업 ID와 필요한 환경 정보를 적어 주세요.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 예상 동작
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제 동작과 로그
+      description: 관련 로그만 발췌하고 자격 증명은 제거해 주세요.
+    validations:
+      required: true

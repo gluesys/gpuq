@@ -1,0 +1,48 @@
+{
+  "enabled": false,
+  "state_dir": "/var/lib/gpuqueue-daos",
+  "hosts": [
+    "da1",
+    "da2",
+    "da3",
+    "da4"
+  ],
+  "control_hosts": [
+    "192.0.2.91",
+    "192.0.2.92",
+    "192.0.2.93",
+    "192.0.2.94"
+  ],
+  "workspace_roots": [
+    "/home",
+    "/mnt/nvme1"
+  ],
+  "startup_timeout": 180,
+  "client_fabric_iface": "ibp65s0",
+  "profiles": {
+    "inst1": {
+      "system": "gpuq_inst1",
+      "port": 10401,
+      "client_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "targets": 4,
+      "hugepages": 2560,
+      "scm_gib": 16,
+      "fabric_port": 31716,
+      "access_points": [
+        "192.0.2.91:10401"
+      ]
+    },
+    "inst2": {
+      "system": "gpuq_inst2",
+      "port": 10401,
+      "client_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "targets": 4,
+      "hugepages": 2560,
+      "scm_gib": 16,
+      "fabric_port": 31716,
+      "access_points": [
+        "192.0.2.91:10401"
+      ]
+    }
+  }
+}

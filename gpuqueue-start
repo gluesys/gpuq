@@ -1,0 +1,7 @@
+#!/bin/bash
+set -euo pipefail
+umask 007
+mkdir -p /run/gpuqueue/jobs
+chmod 1770 /run/gpuqueue/jobs
+/usr/bin/tsp -S 1 >/dev/null
+chmod 0660 "$TS_SOCKET"

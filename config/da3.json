@@ -1,0 +1,42 @@
+{
+  "enabled": false,
+  "host": "da3",
+  "pci": "0000:01:00.0",
+  "serial": "EXAMPLE_NVME_SERIAL_3",
+  "vendor": "0x144d",
+  "device": "0xa80a",
+  "fabric_iface": "ib0",
+  "conflicting_units": [
+    "daos-da12-nvme-server.service",
+    "daos-da34-nvme-server.service",
+    "daos_server.service"
+  ],
+  "profiles": {
+    "inst1": {
+      "system": "gpuq_inst1",
+      "port": 10401,
+      "client_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "targets": 4,
+      "hugepages": 2560,
+      "scm_gib": 16,
+      "fabric_port": 31716,
+      "access_points": [
+        "192.0.2.91:10401"
+      ],
+      "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "inst2": {
+      "system": "gpuq_inst2",
+      "port": 10401,
+      "client_image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "targets": 4,
+      "hugepages": 2560,
+      "scm_gib": 16,
+      "fabric_port": 31716,
+      "access_points": [
+        "192.0.2.91:10401"
+      ],
+      "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  }
+}
