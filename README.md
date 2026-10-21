@@ -67,6 +67,7 @@ gpuq daos-status
 ```
 
 `gpuq`만 실행하면 목록을 표시한다. `--inst` 없는 기존 GPU 전용 작업도 지원한다.
+`--stor lustre|nfsrdma|nvmeof` 는 같은 NVMe 위에 커널 스토리지를 띄운다: [커널 스토리지 작업](docs/kernel-storage.md).
 `--inst` 작업은 서버 준비/실험에 시간 제한을 적용하며, 그 뒤 정리는 별도로 완료한다.
 기존 셸의 기관별 `DAOS_POOL`/`DAOS_CONTAINER`는 새 작업에 넘기지 않는다.
 

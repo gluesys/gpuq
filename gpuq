@@ -103,10 +103,17 @@ def main():
     submit.add_argument("--label", default="gpu")
     submit.add_argument("--inst", choices=("inst1", "inst2"),
                         help="Run an exclusive four-server DAOS lifecycle; all experiment DAOS data is reset afterwards.")
+    submit.add_argument("--stor", choices=("lustre", "nfsrdma", "nvmeof"),
+                        help="Run an exclusive kernel storage lifecycle (Lustre on ZFS, ZFS NFSoRDMA or NVMe-oF) "
+                             "on the research NVMe; it is mounted at $GPUQ_STOR_PATH and reset afterwards.")
+    submit.add_argument("--nodes", type=int, choices=(1, 4), default=1,
+                        help="Storage servers for --stor (NFSoRDMA is single-server).")
     submit.add_argument("command", nargs=argparse.REMAINDER)
     actions.add_parser("list", help="Show the shared queue.")
     actions.add_parser("gpu", help="Show current GPU processes.")
     actions.add_parser("daos-status", help="Show DAOS lease and recovery hold.")
+    sctl = actions.add_parser("stor-ctl", help="Inside a --stor job: cache-cold, cache-warm or status.")
+    sctl.add_argument("op", choices=("cache-cold", "cache-warm", "status"))
     lock = actions.add_parser('lock', help='Root: block new user workloads during maintenance.')
     lock.add_argument('--reason', default='Administrator maintenance')
     actions.add_parser('unlock', help='Root: allow user workloads after maintenance.')
@@ -129,6 +136,8 @@ def main():
         os.execv("/usr/bin/nvidia-smi", ["nvidia-smi"])
     if args.action == "daos-status":
         os.execv("/usr/local/libexec/gpuqueue-daos", ["gpuqueue-daos", "status"])
+    if args.action == "stor-ctl":
+        os.execv("/usr/local/libexec/gpuqueue-daos", ["gpuqueue-daos", "stor-ctl", args.op])
     if args.action == "daos-exec":
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         if not command:
@@ -149,11 +158,14 @@ def main():
         label = f"{user}:{args.label}"
         if any(ord(c) < 32 for c in label) or len(label) > 100:
             parser.error("label must be at most 100 characters without control characters")
-        if args.inst:
-            validated = subprocess.run(["/usr/local/libexec/gpuqueue-daos", "validate", args.inst])
+        if args.inst and args.stor:
+            parser.error("--inst and --stor are exclusive")
+        lifecycle = args.inst or (args.stor + str(args.nodes) if args.stor else None)
+        if lifecycle:
+            validated = subprocess.run(["/usr/local/libexec/gpuqueue-daos", "validate", lifecycle])
             if validated.returncode:
                 sys.exit(validated.returncode)
-            launch = ["/usr/local/libexec/gpuqueue-wait-exec", "--gpuq-daos", args.inst,
+            launch = ["/usr/local/libexec/gpuqueue-wait-exec", "--gpuq-daos", lifecycle,
                       str(args.time), "--", *command]
         else:
             launch = ["/usr/bin/timeout", "--signal=TERM", "--kill-after=30s", f"{args.time}s",

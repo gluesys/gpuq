@@ -246,6 +246,71 @@ class LifecycleTest(unittest.TestCase):
                 thread.join()
 
 
+class StorFixture(FixtureBackend):
+    def payload_env(self, lease):
+        self.events.append('env')
+        return dict(GPUQ_STOR_KIND=lease['profile']['kind'], GPUQ_STOR_PATH=str(self.root / 'mnt'),
+                    GPUQ_STOR_NODES=str(lease['profile']['nodes']), GPUQ_STOR_DEV='')
+
+
+class StorBrokerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.config = dict(enabled=True, state_dir=str(self.root / 'state'), workspace_roots=[str(self.root)],
+                           profiles={'inst1': {'system': 'one'}}, stor=dict(enabled=True))
+        self.daos = FixtureBackend(self.root)
+        self.stor = StorFixture(self.root)
+        self.broker = d.Broker(self.config, self.daos, self.stor)
+        self.logs = []
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def request(self, inst, code='import os; print(os.environ.get("GPUQ_STOR_PATH"), os.environ.get("DAOS_SYSTEM"))'):
+        return dict(action='run', inst=inst, seconds=10, cwd=str(self.root),
+                    argv=[sys.executable, '-c', code], env=dict(PATH=os.environ['PATH']))
+
+    def test_storage_token_uses_storage_backend_and_env(self):
+        self.assertEqual(self.broker.run(os.getuid(), self.request('lustre4'), self.logs.append, lambda: False), 0)
+        self.assertIn(str(self.root / 'mnt') + ' None', ''.join(self.logs))
+        self.assertEqual(self.daos.events, [])
+        self.assertIn('env', self.stor.events)
+        self.assertFalse(self.broker.active.exists())
+
+    def test_storage_validation(self):
+        with self.assertRaisesRegex(ValueError, 'single-server'):
+            self.broker.validate(os.getuid(), dict(action='validate', inst='nfsrdma4'))
+        for bad in ('lustre2', 'nvmeof', 'ext41'):
+            with self.assertRaises(ValueError):
+                self.broker.validate(os.getuid(), dict(action='validate', inst=bad))
+        self.broker.config['stor']['enabled'] = False
+        with self.assertRaisesRegex(ValueError, 'not enabled'):
+            self.broker.validate(os.getuid(), dict(action='validate', inst='lustre1'))
+
+    def test_storage_cleanup_failure_holds_queue_for_daos(self):
+        self.stor.fail_cleanup = True
+        self.assertEqual(self.broker.run(os.getuid(), self.request('nvmeof1'), self.logs.append, lambda: False), 75)
+        self.assertTrue(self.broker.blocked.exists())
+        with self.assertRaisesRegex(RuntimeError, 'recovery required'):
+            self.broker.run(os.getuid(), self.request('inst1'), self.logs.append, lambda: False)
+        self.assertEqual(self.daos.events, [])
+        self.stor.fail_cleanup = False
+        self.broker.recover(0, self.logs.append)
+        self.assertIn('wipe0', self.stor.events)
+        self.assertFalse(self.broker.blocked.exists())
+
+    def test_daos_exec_and_storage_control_are_kind_bound(self):
+        d.atomic_json(self.broker.active, dict(id='a'*32, uid=7, inst='lustre1', phase='running'))
+        with self.assertRaisesRegex(ValueError, 'kernel storage'):
+            self.broker.client_exec(7, dict(lease='a'*32, argv=['true']), self.logs.append)
+        with self.assertRaises(PermissionError):
+            d.stor_control(self.broker, 8, dict(lease='a'*32, op='status'))
+        d.atomic_json(self.broker.active, dict(id='a'*32, uid=7, inst='inst1', phase='running'))
+        with self.assertRaisesRegex(ValueError, 'Not a kernel storage'):
+            d.stor_control(self.broker, 7, dict(lease='a'*32, op='status'))
+
+
 class ProductionBackendTest(unittest.TestCase):
     def test_preflight_rejects_mixed_code_versions_before_start(self):
         profile=dict(system='test',port=10401,client_image='sha256:'+'a'*64)
@@ -414,6 +479,58 @@ class NodeGuardTest(unittest.TestCase):
         self.assertFalse((self.root/'owner.json').exists())
         self.assertTrue((base/'cleanup.json').exists())
 
+
+    def stor_call(self, action, inst='lustre1', index=0):
+        cfg = dict(self.cfg, stor=dict(enabled=True, index=index, fabric_ip='10.0.0.1', fabric_iface='ib0',
+                                       mgs_nid='10.0.0.1@o2ib', client_ip='10.0.0.9', client_hostnqn='nqn.h'))
+        self.config_path.write_text(json.dumps(cfg))
+        with patch.object(sys, 'argv', ['node', action, self.lease, inst]):
+            node.main()
+
+    def test_daos_preflight_refuses_storage_residue(self):
+        with patch.object(node, 'ensure_stopped'), \
+             patch.object(node, 'residue', return_value=['zpool gqdeadbeef']):
+            with self.assertRaisesRegex(RuntimeError, 'zpool gqdeadbeef'):
+                self.call('preflight')
+
+    def test_storage_preflight_refuses_residue_and_foreign_daos_owner(self):
+        with patch.object(node, 'ensure_stopped'), patch.object(node, 'residue', return_value=['nfs export /x']):
+            with self.assertRaisesRegex(RuntimeError, 'nfs export'):
+                self.stor_call('preflight')
+        self.owner(inst='inst1')
+        with self.assertRaisesRegex(RuntimeError, 'Foreign lease'):
+            self.stor_call('stop')
+
+    def test_storage_non_participant_is_noop(self):
+        with patch.object(node, 'run') as cmd, patch.object(node, 'kernel_device') as dev:
+            self.stor_call('start', inst='lustre1', index=2)
+            cmd.assert_not_called()
+            dev.assert_not_called()
+        self.assertFalse((self.root / 'owner.json').exists())
+
+    def test_storage_wipe_requires_stop_then_clears_labels_before_discard(self):
+        self.owner(inst='nvmeof1', phase='running')
+        with self.assertRaisesRegex(RuntimeError, 'Stop must complete'):
+            self.stor_call('wipe', inst='nvmeof1')
+        self.owner(inst='nvmeof1', phase='stopped')
+        order = []
+        with patch.object(node, 'ensure_stopped'), patch.object(node, 'zpools', return_value=[]), \
+             patch.object(node, 'nvmet_subsystems', return_value=[]), \
+             patch.object(node, 'kernel_device', return_value=Path('/fake/nvme0n1')), \
+             patch.object(node, 'clear_partitions', side_effect=lambda dev: order.append('labels')), \
+             patch.object(node, 'discard', side_effect=lambda dev: order.append('discard')), \
+             patch.object(node, 'residue', return_value=[]):
+            self.stor_call('wipe', inst='nvmeof1')
+        self.assertEqual(order, ['labels', 'discard'])
+        self.assertFalse((self.root / 'owner.json').exists())
+
+    def test_storage_wipe_refuses_while_pool_exported(self):
+        self.owner(inst='lustre1', phase='stopped')
+        with patch.object(node, 'ensure_stopped'), patch.object(node, 'zpools', return_value=['gq' + self.lease[:8]]), \
+             patch.object(node, 'discard') as disc:
+            with self.assertRaisesRegex(RuntimeError, 'still exported'):
+                self.stor_call('wipe')
+            disc.assert_not_called()
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
