@@ -23,6 +23,7 @@ import uuid
 CONFIG = '/etc/gpuqueue-daos/config.json'
 MAINTENANCE = Path('/etc/gpuqueue-daos/maintenance.json')
 SOCKET = os.environ.get('GPUQ_DAOS_SOCKET', '/run/gpuqueue-daos/control.sock')
+STOR_RE = re.compile(r'(lustre|nfsrdma|nvmeof)([14])')
 SAFE_ENV = dict(PATH='/usr/sbin:/usr/bin:/sbin:/bin', HOME='/root', LANG='C.UTF-8')
 
 
@@ -65,14 +66,14 @@ class Backend:
                           lease['id'], lease['inst']], timeout=240)
         return result.stdout.strip()
 
-    def all_nodes(self, action, lease):
+    def all_nodes(self, action, lease, hosts=None):
         errors = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            calls = {pool.submit(self.node, h, action, lease): h for h in self.config['hosts']}
+            calls = {pool.submit(self.node, h, action, lease): h for h in (hosts or self.config['hosts'])}
             for future, host in calls.items():
                 try:
                     reply = future.result()
-                    if action == 'preflight':
+                    if action == 'preflight' and not STOR_RE.fullmatch(lease['inst']):
                         info = json.loads(reply)
                         profile = self.profile(lease)
                         expected = profile.get('server_image', profile['client_image'])
@@ -198,10 +199,193 @@ class Backend:
         emit('DAOS cleanup verified on all four servers.\n')
 
 
+class StorBackend(Backend):
+    """Lustre / ZFS NFSoRDMA / NVMe-oF on the research NVMe of the first N nodes.
+
+    The node helper owns the servers; this class owns the cxl2 side (mount, connect, md)
+    and the order: client torn down, then every node stopped, and only then wiped.
+    """
+
+    def scfg(self):
+        return self.config['stor']
+
+    def hosts(self, lease):
+        return self.config['hosts'][:lease['profile']['nodes']]
+
+    def mount_path(self, lease):
+        return Path(self.scfg().get('client_mount_root', '/mnt/gpuq')) / lease['id']
+
+    def state_path(self, lease):
+        return Path(self.config['state_dir']) / 'clients' / lease['id'] / 'stor.json'
+
+    def nqn(self, lease, index):
+        return 'nqn.2026-10.com.gluesys:gpuq:{}:{}'.format(lease['id'], index)
+
+    def fsname(self, lease):
+        return 'g' + lease['id'][:7]
+
+    def record(self, lease, **state):
+        path = self.state_path(lease)
+        old = json.loads(path.read_text()) if path.exists() else {}
+        old.update(state)
+        atomic_json(path, old)
+        return old
+
+    def start(self, lease, cancelled, emit):
+        hosts = self.hosts(lease)
+        self.all_nodes('preflight', lease, hosts)
+        if cancelled.is_set():
+            raise InterruptedError('Cancelled before storage startup')
+        # Node 0 carries the Lustre MGS/MDT; OSTs register with it, so it starts first.
+        self.node(hosts[0], 'start', lease)
+        if len(hosts) > 1:
+            self.all_nodes('start', lease, hosts[1:])
+        if cancelled.is_set():
+            raise InterruptedError('Cancelled during storage startup')
+        self.client_setup(lease)
+        state = json.loads(self.state_path(lease).read_text())
+        emit('Storage ready: {} on {} node(s) at {}{}\n'.format(
+            lease['profile']['kind'], len(hosts), state['path'],
+            ' (device ' + state['device'] + ')' if state.get('device') else ''))
+
+    def client_setup(self, lease):
+        kind, scfg = lease['profile']['kind'], self.scfg()
+        ips = [scfg['server_ips'][h] for h in self.hosts(lease)]
+        mnt = self.mount_path(lease)
+        mnt.mkdir(parents=True, exist_ok=True)
+        self.record(lease, path=str(mnt), phase='client-setup')
+        device = None
+        if kind == 'lustre':
+            command(['/usr/sbin/modprobe', 'lustre'])
+            command(['/usr/sbin/lnetctl', 'lnet', 'configure', '--all'], check=False)
+            command(['/usr/bin/mount', '-t', 'lustre', '{}@o2ib:/{}'.format(ips[0], self.fsname(lease)), str(mnt)],
+                    timeout=180)
+            if len(ips) > 1:
+                command(['/usr/bin/lfs', 'setstripe', '-c', '-1', str(mnt)])
+        elif kind == 'nfsrdma':
+            command(['/usr/sbin/modprobe', 'rpcrdma'])
+            command(['/usr/bin/mount', '-t', 'nfs', '-o', scfg.get(
+                'nfs_mount_options', 'rdma,port=20049,vers=3,rsize=1048576,wsize=1048576,lookupcache=positive,hard'),
+                '{}:{}/jobs/{}/nfs'.format(ips[0], scfg.get('server_state_dir', '/var/lib/gpuqueue-daos'), lease['id']),
+                str(mnt)], timeout=180)
+        else:
+            transport = scfg.get('nvmeof_transport', 'rdma')
+            command(['/usr/sbin/modprobe', 'nvme-' + transport])
+            devices = []
+            for index, ip in enumerate(ips):
+                command(['/usr/sbin/nvme', 'connect', '-t', transport, '-a', ip,
+                         '-s', str(scfg.get('nvmeof_port', 4420)), '-n', self.nqn(lease, index)], timeout=120)
+                devices.append(self.nvme_device(self.nqn(lease, index)))
+            if len(devices) == 1:
+                device = devices[0]
+            else:
+                # device-mapper stripe, 1 MiB chunks; no on-disk metadata, unlike md (whose newer
+                # mdadm also expects md_mod parameters this kernel lacks).
+                name = 'gq' + lease['id'][:8]
+                sectors = min(int(command(['/usr/sbin/blockdev', '--getsz', dev]).stdout) for dev in devices)
+                chunk = 2048
+                length = sectors // chunk * chunk * len(devices)
+                table = '0 {} striped {} {} {}'.format(length, len(devices), chunk,
+                                                       ' '.join(dev + ' 0' for dev in devices))
+                self.record(lease, dm=name)
+                command(['/usr/sbin/dmsetup', 'create', name, '--table', table])
+                device = '/dev/mapper/' + name
+            command(['/usr/sbin/mkfs.xfs', '-f', '-q', device], timeout=300)
+            command(['/usr/bin/mount', device, str(mnt)], timeout=120)
+        if not os.path.ismount(str(mnt)):
+            raise RuntimeError('Storage mount did not appear at ' + str(mnt))
+        user = pwd.getpwuid(lease['uid'])
+        os.chown(str(mnt), user.pw_uid, user.pw_gid)
+        os.chmod(str(mnt), 0o755)
+        self.record(lease, phase='mounted', device=device)
+
+    def nvme_device(self, nqn):
+        """Namespace block device for a connected subsystem (native multipath head or plain)."""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            for root in ('/sys/class/nvme-subsystem', '/sys/class/nvme'):
+                for item in Path(root).glob('nvme*'):
+                    try:
+                        if (item / 'subsysnqn').read_text().strip() != nqn:
+                            continue
+                    except OSError:
+                        continue
+                    names = [p.name for p in item.iterdir() if re.fullmatch(r'nvme[0-9]+n[0-9]+', p.name)]
+                    if len(names) == 1 and Path('/dev', names[0]).exists():
+                        return '/dev/' + names[0]
+            time.sleep(0.5)
+        raise RuntimeError('NVMe-oF namespace did not appear for ' + nqn)
+
+    def payload_env(self, lease):
+        state = json.loads(self.state_path(lease).read_text())
+        return dict(GPUQ_STOR_KIND=lease['profile']['kind'], GPUQ_STOR_NODES=str(lease['profile']['nodes']),
+                    GPUQ_STOR_PATH=state['path'], GPUQ_STOR_DEV=state.get('device') or '')
+
+    def client_teardown(self, lease):
+        mnt = self.mount_path(lease)
+        if os.path.ismount(str(mnt)):
+            command(['/usr/bin/sync'], timeout=300, check=False)
+            if command(['/usr/bin/umount', str(mnt)], timeout=300, check=False).returncode:
+                command(['/usr/bin/umount', '-f', str(mnt)], timeout=120, check=False)
+            if os.path.ismount(str(mnt)):
+                raise RuntimeError('Client mount still busy: ' + str(mnt))
+        dm = '/dev/mapper/gq' + lease['id'][:8]
+        if os.path.exists(dm):
+            command(['/usr/sbin/dmsetup', 'remove', '--retry', os.path.basename(dm)], timeout=120)
+        prefix = 'nqn.2026-10.com.gluesys:gpuq:{}:'.format(lease['id'])
+        for ctrl in Path('/sys/class/nvme').glob('nvme*'):
+            try:
+                nqn = (ctrl / 'subsysnqn').read_text().strip()
+            except OSError:
+                continue
+            if nqn.startswith(prefix):
+                command(['/usr/sbin/nvme', 'disconnect', '-n', nqn], timeout=120)
+        left = [c.name for c in Path('/sys/class/nvme').glob('nvme*')
+                if (c / 'subsysnqn').exists() and (c / 'subsysnqn').read_text().strip().startswith(prefix)]
+        if left:
+            raise RuntimeError('NVMe-oF controllers still connected: ' + ', '.join(left))
+        if mnt.is_dir():
+            mnt.rmdir()
+        if self.state_path(lease).exists():
+            self.record(lease, phase='client-clean')
+
+    def cleanup(self, lease, emit):
+        self.client_teardown(lease)
+        hosts = self.hosts(lease)
+        errors = []
+        if len(hosts) > 1:
+            try:
+                self.all_nodes('stop', lease, hosts[1:])
+            except Exception as error:
+                errors.append(str(error))
+        try:
+            self.node(hosts[0], 'stop', lease)
+        except Exception as error:
+            errors.append('{}: {}'.format(hosts[0], error))
+        if errors:
+            raise RuntimeError('; '.join(errors))
+        # No disk can be wiped until ALL participating nodes have proved their servers stopped.
+        emit('Storage servers stopped; resetting research NVMe on {} node(s).\n'.format(len(hosts)))
+        self.all_nodes('wipe', lease, hosts)
+        emit('Storage cleanup verified on {} node(s).\n'.format(len(hosts)))
+
+    def control(self, lease, op):
+        if op == 'status':
+            return json.loads(self.state_path(lease).read_text())
+        mnt = self.mount_path(lease)
+        command(['/usr/bin/sync'], timeout=300, check=False)
+        if lease['profile']['kind'] == 'lustre':
+            command(['/usr/sbin/lctl', 'set_param', '-n', 'ldlm.namespaces.*.lru_size=clear'], check=False)
+        Path('/proc/sys/vm/drop_caches').write_text('3\n')
+        self.all_nodes(op, lease, self.hosts(lease))
+        return dict(op=op, path=str(mnt))
+
+
 class Broker:
-    def __init__(self, config, backend=None):
+    def __init__(self, config, backend=None, stor_backend=None):
         self.config = config
         self.backend = backend or Backend(config)
+        self.stor_backend = stor_backend or StorBackend(config)
         self.root = Path(config['state_dir'])
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
@@ -210,6 +394,9 @@ class Broker:
         self.blocked = self.root / 'blocked.json'
         if self.active.exists():
             atomic_json(self.blocked, {'reason': 'Interrupted lease; root recovery required'})
+
+    def backend_for(self, lease):
+        return self.stor_backend if STOR_RE.fullmatch(lease['inst']) else self.backend
 
     def status(self):
         return {'enabled': self.config.get('enabled', False),
@@ -238,7 +425,13 @@ class Broker:
             raise ValueError('Maintenance locked: ' + json.loads(MAINTENANCE.read_text())['reason'])
         if not self.config.get('enabled', False):
             raise ValueError('DAOS lifecycle is not enabled; existing DAOS data is preserved')
-        if request.get('inst') not in self.config['profiles']:
+        stor = STOR_RE.fullmatch(request.get('inst') or '')
+        if stor:
+            if not self.config.get('stor', {}).get('enabled'):
+                raise ValueError('Kernel storage lifecycle is not enabled')
+            if stor.group(1) == 'nfsrdma' and stor.group(2) != '1':
+                raise ValueError('NFSoRDMA is a single-server path; use --nodes 1')
+        elif request.get('inst') not in self.config['profiles']:
             raise ValueError('Unknown institution profile')
         if request.get('action') == 'validate':
             return
@@ -272,9 +465,12 @@ class Broker:
             if self.blocked.exists() or self.active.exists():
                 raise RuntimeError('Queue held: DAOS recovery required')
             self.cancelled.clear()
+            stor = STOR_RE.fullmatch(request['inst'])
             lease = {'id': uuid.uuid4().hex, 'uid': uid, 'inst': request['inst'],
                      'cwd': request['cwd'], 'phase': 'starting', 'started': time.time(),
-                     'profile': dict(self.config['profiles'][request['inst']])}
+                     'profile': dict(kind=stor.group(1), nodes=int(stor.group(2))) if stor
+                     else dict(self.config['profiles'][request['inst']])}
+            backend = self.backend_for(lease)
             atomic_json(self.active, lease)
             deadline = time.monotonic() + request['seconds']
             watchdog_stop = threading.Event()
@@ -288,8 +484,9 @@ class Broker:
             watcher.start()
             code = 1
             try:
-                emit('gpuq DAOS lease {} ({}) starting\n'.format(lease['id'], lease['inst']))
-                self.backend.start(lease, self.cancelled, emit)
+                emit('gpuq {} lease {} ({}) starting\n'.format('storage' if stor else 'DAOS',
+                                                               lease['id'], lease['inst']))
+                backend.start(lease, self.cancelled, emit)
                 if self.cancelled.is_set():
                     raise InterruptedError('Cancelled or time limit reached during startup')
                 lease['phase'] = 'running'
@@ -297,15 +494,18 @@ class Broker:
                 user = pwd.getpwuid(uid)
                 env = dict(request.get('env', {}), HOME=user.pw_dir, USER=user.pw_name,
                            LOGNAME=user.pw_name, CUDA_VISIBLE_DEVICES='0',
-                           GPUQ_LEASE_ID=lease['id'], GPUQ_INST=lease['inst'],
-                           DAOS_SYSTEM=self.config['profiles'][lease['inst']]['system'])
+                           GPUQ_LEASE_ID=lease['id'], GPUQ_INST=lease['inst'])
                 env.pop('DAOS_POOL', None)
                 env.pop('DAOS_CONTAINER', None)
                 env.pop('DAOS_POSIX_CONTAINER', None)
-                # Host client matches the baseline version; daos-exec uses the profile image.
-                env['DAOS_AGENT_DRPC_DIR'] = str(self.root / 'clients' / lease['id'] / 'run')
-                env['DAOS_CONTROL_CONFIG'] = str(self.root / 'clients' / lease['id'] / 'daos_control.yml')
-                proc = self.backend.payload(lease, request, env)
+                if stor:
+                    env.update(backend.payload_env(lease))
+                else:
+                    env['DAOS_SYSTEM'] = self.config['profiles'][lease['inst']]['system']
+                    # Host client matches the baseline version; daos-exec uses the profile image.
+                    env['DAOS_AGENT_DRPC_DIR'] = str(self.root / 'clients' / lease['id'] / 'run')
+                    env['DAOS_CONTROL_CONFIG'] = str(self.root / 'clients' / lease['id'] / 'daos_control.yml')
+                proc = backend.payload(lease, request, env)
                 os.set_blocking(proc.stdout.fileno(), False)
                 while True:
                     if self.cancelled.is_set():
@@ -327,7 +527,7 @@ class Broker:
                 emit(str(error) + '\n')
                 code = 124 if time.monotonic() >= deadline else 130
             except Exception as error:
-                emit('DAOS job failed: {}\n'.format(error))
+                emit('{} job failed: {}\n'.format('Storage' if stor else 'DAOS', error))
                 code = 1
             finally:
                 watchdog_stop.set()
@@ -337,11 +537,11 @@ class Broker:
                 try:
                     # A startup preflight failure has no node ownership. The node helper's stop/wipe
                     # actions are no-ops without this exact lease; foreign leases always fail closed.
-                    self.backend.stop_payload(lease)
+                    backend.stop_payload(lease)
                     if proc is not None:
                         proc.wait(timeout=30)
                         proc.stdout.close()
-                    self.backend.cleanup(lease, emit)
+                    backend.cleanup(lease, emit)
                     cleaned = True
                 except Exception as error:
                     atomic_json(self.blocked, {'reason': str(error), 'lease': lease['id']})
@@ -364,8 +564,8 @@ class Broker:
                 lease = json.loads(self.active.read_text())
                 if lease.get('activation') and lease['phase'] != 'cleaning':
                     raise RuntimeError('Activation incomplete: claim all four nodes before recovery')
-                self.backend.stop_payload(lease)
-                self.backend.cleanup(lease, emit)
+                self.backend_for(lease).stop_payload(lease)
+                self.backend_for(lease).cleanup(lease, emit)
                 atomic_json(self.root / (lease['id'] + '.json'), dict(lease, cleanup_complete=True,
                                                                     recovered=True, recovered_at=time.time()))
                 self.active.unlink()
@@ -379,6 +579,8 @@ class Broker:
         lease = json.loads(self.active.read_text())
         if lease['uid'] != uid or lease['id'] != request.get('lease') or lease['phase'] != 'running':
             raise PermissionError('Command must belong to the active institution job')
+        if STOR_RE.fullmatch(lease['inst']):
+            raise ValueError('daos-exec is not available in a kernel storage job')
         argv = request.get('argv')
         if not isinstance(argv, list) or not argv or any(not isinstance(v, str) or '\0' in v for v in argv):
             raise ValueError('Invalid client command')
@@ -409,6 +611,19 @@ class Broker:
                 proc.kill()
                 proc.wait()
             proc.stdout.close()
+
+
+def stor_control(broker, uid, request):
+    if request.get('op') not in ('cache-cold', 'cache-warm', 'status'):
+        raise ValueError('Unknown storage control')
+    if not broker.active.exists():
+        raise RuntimeError('No active storage lease')
+    lease = json.loads(broker.active.read_text())
+    if lease['uid'] != uid or lease['id'] != request.get('lease') or lease['phase'] != 'running':
+        raise PermissionError('Storage control must come from the running job')
+    if not STOR_RE.fullmatch(lease['inst']):
+        raise ValueError('Not a kernel storage job')
+    return broker.stor_backend.control(lease, request['op'])
 
 
 class Handler(socketserver.StreamRequestHandler):
@@ -453,6 +668,8 @@ class Handler(socketserver.StreamRequestHandler):
                 send({'exit_code': 0})
             elif action == 'exec':
                 send({'exit_code': broker.client_exec(uid, request, emit, gone)})
+            elif action == 'stor-ctl':
+                send({'log': json.dumps(stor_control(broker, uid, request)) + '\n', 'exit_code': 0})
             else:
                 raise ValueError('Unknown action')
         except Exception as error:
@@ -495,9 +712,11 @@ def main():
     e = subs.add_parser('exec')
     e.add_argument('command', nargs=argparse.REMAINDER)
     v = subs.add_parser('validate')
-    v.add_argument('inst', choices=['inst1', 'inst2'])
+    v.add_argument('inst')
     r = subs.add_parser('run')
-    r.add_argument('inst', choices=['inst1', 'inst2'])
+    r.add_argument('inst')
+    c = subs.add_parser('stor-ctl')
+    c.add_argument('op', choices=['cache-cold', 'cache-warm', 'status'])
     r.add_argument('seconds', type=int)
     r.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -527,6 +746,8 @@ def main():
         if args.action == 'exec':
             argv = args.command[1:] if args.command[:1] == ['--'] else args.command
             request.update(lease=os.environ.get('GPUQ_LEASE_ID'), argv=argv)
+        if args.action == 'stor-ctl':
+            request.update(lease=os.environ.get('GPUQ_LEASE_ID'), op=args.op)
         if args.action in ('run', 'validate'):
             request['inst'] = args.inst
         if args.action == 'run':

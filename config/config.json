@@ -44,5 +44,17 @@
         "192.0.2.91:10401"
       ]
     }
+  },
+  "stor": {
+    "enabled": false,
+    "client_mount_root": "/mnt/gpuq",
+    "server_ips": {
+      "da1": "198.51.100.91",
+      "da2": "198.51.100.92",
+      "da3": "198.51.100.93",
+      "da4": "198.51.100.94"
+    },
+    "nvmeof_transport": "tcp",
+    "nvmeof_port": 4420
   }
 }

@@ -38,5 +38,19 @@
       ],
       "image": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
     }
+  },
+  "stor": {
+    "enabled": false,
+    "index": 1,
+    "fabric_ip": "198.51.100.92",
+    "fabric_iface": "ib0",
+    "mgs_nid": "198.51.100.91@o2ib",
+    "client_ip": "198.51.100.192",
+    "client_hostnqn": "nqn.2014-08.org.nvmexpress:uuid:EXAMPLE-CLIENT",
+    "arc_max_job": 17179869184,
+    "arc_max_default": 2147483648,
+    "nvmeof_transport": "tcp",
+    "nvmeof_port": 4420,
+    "nvmet_port_id": 1
   }
 }
